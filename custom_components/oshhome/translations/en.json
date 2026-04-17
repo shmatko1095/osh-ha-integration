@@ -1,0 +1,29 @@
+{
+  "title": "OSHHome",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to OSHHome",
+        "description": "Sign in to your OSH account to link devices."
+      },
+      "reauth_confirm": {
+        "title": "[%key:common::config_flow::title::reauth%]",
+        "description": "The OSHHome integration needs to re-authenticate your account."
+      },
+      "reconfigure": {
+        "title": "Reconnect websocket session",
+        "description": "Create a new installation id and reconnect push stream."
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to OSH backend.",
+      "invalid_auth": "Authentication failed with OSH backend."
+    },
+    "abort": {
+      "already_configured": "This OSH account is already configured.",
+      "reauth_account_mismatch": "Please authenticate with the same OSH account.",
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]",
+      "reconfigure_successful": "OSHHome connection updated."
+    }
+  }
+}

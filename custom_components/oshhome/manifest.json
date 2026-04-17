@@ -1,0 +1,19 @@
+{
+  "domain": "oshhome",
+  "name": "OSHHome",
+  "codeowners": [
+    "@oshhome"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/oshhome/osh-ha-integration",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "requirements": [],
+  "dependencies": [
+    "auth"
+  ],
+  "version": "0.1.0",
+  "loggers": [
+    "custom_components.oshhome"
+  ]
+}
