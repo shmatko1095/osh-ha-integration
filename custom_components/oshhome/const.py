@@ -20,7 +20,8 @@ CONF_INSTALLATION_ID = "installation_id"
 CONF_AUTH_IMPLEMENTATION = "auth_implementation"
 CONF_TOKEN = "token"
 
-DEFAULT_API_BASE_URL = "http://localhost:18080"
+DEFAULT_API_BASE_URL = "https://api.oshhome.com"
+# DEFAULT_API_BASE_URL = "http://localhost:18080"
 DEFAULT_REST_TIMEOUT = 15
 
 OAUTH_CLIENT_ID = "osh-home-assistant"

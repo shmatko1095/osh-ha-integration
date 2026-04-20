@@ -13,6 +13,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import OshHomeApiClient, OshHomeAuthError
@@ -60,6 +62,7 @@ class OshHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.cursor = 0
         self._stream_task: asyncio.Task[None] | None = None
+        self._refresh_task: asyncio.Task[None] | None = None
 
         self._device_payloads: dict[str, dict[str, Any]] = {}
         self._entity_payloads: dict[str, dict[str, Any]] = {}
@@ -85,6 +88,11 @@ class OshHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._stream_task
             self._stream_task = None
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._refresh_task
+            self._refresh_task = None
 
     def async_subscribe_inventory(self, platform: str, callback) -> callable:
         """Subscribe for inventory changes for one platform."""
@@ -175,7 +183,9 @@ class OshHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Command rejected: {response.get('errorCode') or response.get('errorMessage') or 'unknown'}"
             )
         self.cursor = max(self.cursor, int(response.get("cursor", self.cursor)))
-        changed = self._apply_updated_states(response.get("updatedStates"))
+        changed, needs_refresh = self._apply_updated_states(response.get("updatedStates"))
+        if needs_refresh:
+            self._schedule_coalesced_refresh("unknown_entity_in_command_response")
         if changed:
             self.async_set_updated_data(self._snapshot())
         return response
@@ -213,18 +223,23 @@ class OshHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if response.get("reset_required"):
             await self.async_request_refresh()
             return
-        self._apply_states_payload(response)
+        needs_refresh = self._apply_states_payload(response)
         self.async_set_updated_data(self._snapshot())
+        if needs_refresh:
+            self._schedule_coalesced_refresh("unknown_entity_in_states_replay")
 
     async def _async_handle_stream_message(self, message: dict[str, Any]) -> None:
         """Process one websocket payload."""
         msg_type = message.get("type")
         if msg_type == "entity_delta":
-            self._apply_delta(message)
-            self.async_set_updated_data(self._snapshot())
+            changed, needs_refresh = self._apply_delta(message)
+            if changed:
+                self.async_set_updated_data(self._snapshot())
+            if needs_refresh:
+                self._schedule_coalesced_refresh("unknown_entity_in_ws_delta")
             return
         if msg_type == "inventory_changed":
-            await self.async_request_refresh()
+            self._schedule_coalesced_refresh("inventory_changed")
             return
         if msg_type in {"ready", "pong"}:
             return
@@ -285,33 +300,49 @@ class OshHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.cursor,
         )
         self._notify_inventory_changes(old_platform_map, new_platform_map)
+        self._prune_stale_device_registry_entries()
+        self._prune_stale_entity_registry_entries()
 
-    def _apply_states_payload(self, payload: dict[str, Any]) -> None:
+    def _apply_states_payload(self, payload: dict[str, Any]) -> bool:
         """Apply `/states` response payload."""
-        self.cursor = max(self.cursor, int(payload.get("cursor", self.cursor)))
+        self.cursor = max(self.cursor, self._safe_int(payload.get("cursor"), self.cursor))
+        needs_refresh = False
         for item in payload.get("items", []):
-            self._apply_delta(item)
+            _, unknown_entity = self._apply_delta(item)
+            needs_refresh = needs_refresh or unknown_entity
+        return needs_refresh
 
-    def _apply_updated_states(self, updated_states: Any) -> bool:
+    def _apply_updated_states(self, updated_states: Any) -> tuple[bool, bool]:
         """Apply command response deltas without a forced bootstrap refresh."""
         if not isinstance(updated_states, list):
-            return False
+            return False, False
         changed = False
+        needs_refresh = False
         for item in updated_states:
             if not isinstance(item, dict):
                 continue
-            self._apply_delta(item)
-            changed = True
-        return changed
+            applied, unknown_entity = self._apply_delta(item)
+            changed = changed or applied
+            needs_refresh = needs_refresh or unknown_entity
+        return changed, needs_refresh
 
-    def _apply_delta(self, payload: dict[str, Any]) -> None:
+    def _apply_delta(self, payload: dict[str, Any] | Any) -> tuple[bool, bool]:
         """Apply one delta payload to runtime state."""
+        if not isinstance(payload, dict):
+            return False, False
+        payload_cursor = self._safe_int(payload.get("cursor"), self.cursor)
+        self.cursor = max(self.cursor, payload_cursor)
+
         entity_uid = payload.get("entity_uid")
         if not isinstance(entity_uid, str):
-            return
+            return False, False
         if entity_uid not in self._entity_payloads:
-            _LOGGER.debug("Ignoring delta for unknown entity_uid=%s", entity_uid)
-            return
+            _LOGGER.debug(
+                "Received delta for unknown entity_uid=%s cursor=%s, scheduling bootstrap refresh",
+                entity_uid,
+                payload_cursor,
+            )
+            return False, True
         runtime = self._entity_runtime.setdefault(
             entity_uid,
             {
@@ -323,9 +354,114 @@ class OshHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         runtime[ATTR_STATE] = payload.get("state", runtime.get(ATTR_STATE, {}))
         runtime[ATTR_ATTRIBUTES] = payload.get("attributes", runtime.get(ATTR_ATTRIBUTES, {}))
-        runtime[ATTR_CURSOR] = int(payload.get("cursor", runtime.get(ATTR_CURSOR, self.cursor)))
+        runtime[ATTR_CURSOR] = self._safe_int(
+            payload.get("cursor"),
+            self._safe_int(runtime.get(ATTR_CURSOR), self.cursor),
+        )
         runtime[ATTR_DELETED] = bool(payload.get("deleted", False))
         self.cursor = max(self.cursor, int(runtime[ATTR_CURSOR]))
+        return True, False
+
+    def _schedule_coalesced_refresh(self, reason: str) -> None:
+        """Ensure only one bootstrap refresh runs at a time."""
+        if self._refresh_task is not None:
+            if not self._refresh_task.done():
+                return
+            self._refresh_task = None
+
+        async def _refresh() -> None:
+            try:
+                await self.async_request_refresh()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Coalesced refresh failed (%s): %s", reason, err)
+            finally:
+                self._refresh_task = None
+
+        if hasattr(self.entry, "async_create_background_task"):
+            self._refresh_task = self.entry.async_create_background_task(
+                self.hass,
+                _refresh(),
+                "oshhome_coalesced_refresh",
+            )
+        else:
+            self._refresh_task = self.hass.async_create_task(_refresh())
+
+    def _safe_int(self, value: Any, fallback: int | None = None) -> int:
+        """Convert unknown payload cursor value to int safely."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            if fallback is None:
+                return self.cursor
+            return int(fallback)
+
+    def _prune_stale_entity_registry_entries(self) -> None:
+        """Delete stale registry entities that are no longer present in bootstrap."""
+        active_entity_uids = set(self._entity_payloads.keys())
+        registry = er.async_get(self.hass)
+        stale_entity_ids: list[str] = []
+
+        for entry in er.async_entries_for_config_entry(registry, self.entry.entry_id):
+            if entry.platform != DOMAIN:
+                continue
+            unique_id = entry.unique_id
+            if not isinstance(unique_id, str) or not unique_id.strip():
+                _LOGGER.warning(
+                    "Skipping registry prune for entity_id=%s due invalid unique_id=%r",
+                    entry.entity_id,
+                    unique_id,
+                )
+                continue
+            if unique_id not in active_entity_uids:
+                stale_entity_ids.append(entry.entity_id)
+
+        for entity_id in stale_entity_ids:
+            registry.async_remove(entity_id)
+
+        if stale_entity_ids:
+            _LOGGER.info(
+                "Pruned stale OSHHome entities from registry count=%s entities=%s",
+                len(stale_entity_ids),
+                stale_entity_ids,
+            )
+        else:
+            _LOGGER.debug("No stale OSHHome entities found in registry after bootstrap")
+
+    def _prune_stale_device_registry_entries(self) -> None:
+        """Delete stale registry devices that are no longer present in bootstrap."""
+        active_device_uids = set(self._device_payloads.keys())
+        registry = dr.async_get(self.hass)
+        stale_device_ids: list[str] = []
+
+        for entry in dr.async_entries_for_config_entry(registry, self.entry.entry_id):
+            identifiers = getattr(entry, "identifiers", set()) or set()
+            oshhome_identifiers = {
+                identifier[1]
+                for identifier in identifiers
+                if isinstance(identifier, tuple)
+                and len(identifier) == 2
+                and identifier[0] == DOMAIN
+                and isinstance(identifier[1], str)
+                and identifier[1].strip()
+            }
+            if not oshhome_identifiers:
+                continue
+            if any(identifier not in active_device_uids for identifier in oshhome_identifiers):
+                device_id = getattr(entry, "id", None)
+                if isinstance(device_id, str) and device_id:
+                    stale_device_ids.append(device_id)
+
+        for device_id in stale_device_ids:
+            registry.async_remove_device(device_id)
+
+        if stale_device_ids:
+            _LOGGER.info(
+                "Pruned stale OSHHome devices from registry count=%s devices=%s",
+                len(stale_device_ids),
+                stale_device_ids,
+            )
+        else:
+            _LOGGER.debug("No stale OSHHome devices found in registry after bootstrap")
 
     def _snapshot(self) -> dict[str, Any]:
         """Build coordinator data snapshot."""

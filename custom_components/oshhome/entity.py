@@ -66,6 +66,7 @@ class OshHomeBaseEntity(CoordinatorEntity[OshHomeCoordinator], Entity):
             return None
         device = self.coordinator.get_device_payload(device_uid) or {}
         via_device_uid = device.get("via_device_uid")
+        serial = device.get("serial")
 
         return DeviceInfo(
             identifiers={(DOMAIN, device_uid)},
@@ -74,6 +75,7 @@ class OshHomeBaseEntity(CoordinatorEntity[OshHomeCoordinator], Entity):
             model=device.get("model") or device.get("kind"),
             sw_version=device.get("sw_version"),
             hw_version=device.get("hw_version"),
+            serial_number=serial if isinstance(serial, str) and serial else None,
             via_device=(DOMAIN, via_device_uid) if via_device_uid else None,
         )
 
