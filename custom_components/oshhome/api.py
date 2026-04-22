@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+import contextlib
 from typing import Any
 
 from aiohttp import ClientResponseError, ClientSession, WSMsgType, WSServerHandshakeError
@@ -14,8 +16,28 @@ class OshHomeAuthError(Exception):
     """Raised when OSHHome credentials are invalid or expired."""
 
 
+class OshHomeWebSocketClosed(Exception):
+    """Raised when websocket stream closes and reconnect should be attempted."""
+
+    def __init__(
+        self,
+        close_code: int | None,
+        message_type: WSMsgType,
+        reason: str | None = None,
+    ) -> None:
+        self.close_code = close_code
+        self.message_type = message_type
+        self.reason = reason
+        details = reason or "stream closed"
+        super().__init__(
+            f"WebSocket stream closed type={message_type.name} code={close_code}: {details}"
+        )
+
+
 class OshHomeApiClient:
     """Thin async client for the OSHHome BFF."""
+
+    _APP_PING_INTERVAL_SECONDS = 25
 
     def __init__(
         self,
@@ -60,13 +82,33 @@ class OshHomeApiClient:
                 "last_cursor": int(last_cursor),
             }
         )
+        ping_task = asyncio.create_task(self._async_app_ping_loop(websocket))
         try:
             async for message in websocket:
                 if message.type == WSMsgType.TEXT:
                     yield message.json()
                 elif message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
-                    break
+                    reason: str | None = None
+                    if message.type == WSMsgType.ERROR:
+                        error = websocket.exception()
+                        if error is not None:
+                            reason = str(error)
+                    if reason is None and isinstance(message.extra, str) and message.extra:
+                        reason = message.extra
+                    raise OshHomeWebSocketClosed(
+                        self._safe_close_code(websocket.close_code),
+                        message.type,
+                        reason,
+                    )
+            raise OshHomeWebSocketClosed(
+                self._safe_close_code(websocket.close_code),
+                WSMsgType.CLOSED,
+                "websocket iterator ended",
+            )
         finally:
+            ping_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ping_task
             await websocket.close()
 
     async def _request_json(
@@ -101,3 +143,21 @@ class OshHomeApiClient:
     def _raise_auth_error_if_needed(err: ClientResponseError | WSServerHandshakeError) -> None:
         if err.status in (401, 403):
             raise OshHomeAuthError("OAuth token rejected by OSH backend") from err
+
+    @staticmethod
+    def _safe_close_code(value: Any) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _async_app_ping_loop(self, websocket: Any) -> None:
+        """Keep app-level ping/pong flow active for intermediaries/proxies."""
+        while True:
+            await asyncio.sleep(self._APP_PING_INTERVAL_SECONDS)
+            if getattr(websocket, "closed", False):
+                return
+            try:
+                await websocket.send_json({"type": "ping"})
+            except Exception:  # noqa: BLE001
+                return

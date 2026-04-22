@@ -17,7 +17,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .api import OshHomeApiClient, OshHomeAuthError
+from .api import OshHomeApiClient, OshHomeAuthError, OshHomeWebSocketClosed
 from .const import (
     ATTR_ATTRIBUTES,
     ATTR_CURSOR,
@@ -205,13 +205,32 @@ class OshHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 backoff_seconds = 1
                 async for message in self.client.async_stream(self._installation_id, self.cursor):
                     await self._async_handle_stream_message(message)
-                raise ConnectionError("WebSocket stream closed")
             except asyncio.CancelledError:
                 raise
             except OshHomeAuthError:
                 _LOGGER.warning("OAuth token rejected by backend, starting reauth flow")
                 self.entry.async_start_reauth(self.hass)
                 return
+            except OshHomeWebSocketClosed as err:
+                close_code = err.close_code
+                if close_code in (1000, 1001):
+                    _LOGGER.debug(
+                        "OSHHome websocket closed gracefully (type=%s code=%s reason=%s), reconnecting in %ss",
+                        err.message_type.name,
+                        close_code,
+                        err.reason or "n/a",
+                        backoff_seconds,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "OSHHome websocket closed unexpectedly (type=%s code=%s reason=%s), retrying in %ss",
+                        err.message_type.name,
+                        close_code,
+                        err.reason or "n/a",
+                        backoff_seconds,
+                    )
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, 60)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("OSHHome websocket loop failed (%s), retrying in %ss", err, backoff_seconds)
                 await asyncio.sleep(backoff_seconds)

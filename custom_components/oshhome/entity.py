@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+import contextlib
 import logging
 from typing import Any
 
@@ -107,6 +109,7 @@ class OshHomeEntityManager:
         self._factory = factory
         self._entities: dict[str, Entity] = {}
         self._unsubscribe: Callable[[], None] | None = None
+        self._remove_tasks: set[asyncio.Task[None]] = set()
 
     async def async_setup(self) -> None:
         """Create initial entities and subscribe for inventory changes."""
@@ -131,7 +134,7 @@ class OshHomeEntityManager:
             self._unsubscribe()
             self._unsubscribe = None
         for entity in list(self._entities.values()):
-            entity.async_remove()
+            self._schedule_entity_remove(entity)
         self._entities.clear()
 
     def _handle_inventory_update(self, added: set[str], removed: set[str]) -> None:
@@ -145,8 +148,46 @@ class OshHomeEntityManager:
         for entity_uid in removed:
             entity = self._entities.pop(entity_uid, None)
             if entity is not None:
-                entity.async_remove()
+                self._schedule_entity_remove(entity)
         self._add_entities(added)
+
+    def _schedule_entity_remove(self, entity: Entity) -> None:
+        """Remove an entity without leaving un-awaited coroutine warnings."""
+        coordinator_hass = getattr(self._coordinator, "hass", None)
+        if coordinator_hass is None:
+            _LOGGER.debug(
+                "Skipping entity remove for platform %s because coordinator hass is missing",
+                self._platform,
+            )
+            return
+
+        if hasattr(entity, "hass") and getattr(entity, "hass") is None:
+            _LOGGER.debug(
+                "Skipping entity remove for platform %s because entity is detached from hass",
+                self._platform,
+            )
+            return
+
+        try:
+            remove_result = entity.async_remove()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Entity async_remove call failed", exc_info=True)
+            return
+        if not asyncio.iscoroutine(remove_result):
+            return
+        task = coordinator_hass.async_create_task(remove_result)
+        self._remove_tasks.add(task)
+        task.add_done_callback(self._remove_tasks.discard)
+        task.add_done_callback(self._log_remove_task_failure)
+
+    @staticmethod
+    def _log_remove_task_failure(task: asyncio.Task[None]) -> None:
+        """Log async_remove failures from background tasks."""
+        with contextlib.suppress(asyncio.CancelledError):
+            try:
+                task.result()
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning("Entity async_remove task failed", exc_info=True)
 
     def _add_entities(self, entity_uids: set[str]) -> None:
         entities_to_add: list[Entity] = []

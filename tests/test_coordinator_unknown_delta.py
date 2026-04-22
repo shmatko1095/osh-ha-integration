@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import sys
 import types
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 def _install_homeassistant_stubs() -> None:
@@ -30,7 +32,7 @@ def _install_homeassistant_stubs() -> None:
     class ClientSession:  # noqa: D401 - test stub
         """Client session stub."""
 
-    class _WSMsgType:
+    class _WSMsgType(enum.Enum):
         TEXT = 1
         CLOSE = 2
         CLOSED = 3
@@ -84,6 +86,26 @@ def _install_homeassistant_stubs() -> None:
 
     helpers = types.ModuleType("homeassistant.helpers")
     sys.modules["homeassistant.helpers"] = helpers
+
+    entity = types.ModuleType("homeassistant.helpers.entity")
+
+    class DeviceInfo(dict):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+
+    class Entity:
+        async def async_remove(self) -> None:
+            return None
+
+    class EntityCategory(enum.Enum):
+        CONFIG = "config"
+        DIAGNOSTIC = "diagnostic"
+
+    entity.DeviceInfo = DeviceInfo
+    entity.Entity = Entity
+    entity.EntityCategory = EntityCategory
+    sys.modules["homeassistant.helpers.entity"] = entity
+    helpers.entity = entity
 
     entity_registry = types.ModuleType("homeassistant.helpers.entity_registry")
 
@@ -195,7 +217,15 @@ def _install_homeassistant_stubs() -> None:
         def async_set_updated_data(self, data: Any) -> None:
             self.data = data
 
+    class CoordinatorEntity:
+        def __class_getitem__(cls, _item):
+            return cls
+
+        def __init__(self, coordinator: Any) -> None:
+            self.coordinator = coordinator
+
     update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
+    update_coordinator.CoordinatorEntity = CoordinatorEntity
     sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
 
     config_entry_oauth2_flow = types.ModuleType("homeassistant.helpers.config_entry_oauth2_flow")
@@ -255,6 +285,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from custom_components.oshhome.coordinator import OshHomeCoordinator  # noqa: E402
+from custom_components.oshhome.api import OshHomeWebSocketClosed  # noqa: E402
+from custom_components.oshhome.entity import OshHomeEntityManager  # noqa: E402
 
 
 class CoordinatorUnknownDeltaTest(unittest.IsolatedAsyncioTestCase):
@@ -292,6 +324,45 @@ class CoordinatorUnknownDeltaTest(unittest.IsolatedAsyncioTestCase):
         coordinator._schedule_coalesced_refresh("unknown_entity")
         await asyncio.gather(*coordinator.hass.tasks)
         self.assertEqual(refresh_calls, 1)
+
+    async def test_stream_loop_graceful_close_logs_debug(self) -> None:
+        ws_msg_type = sys.modules["aiohttp"].WSMsgType
+        close_error = OshHomeWebSocketClosed(1000, ws_msg_type.CLOSED, "normal_close")
+        coordinator, replay_calls = _make_stream_loop_coordinator(close_error)
+        sleep_mock = mock.AsyncMock(return_value=None)
+
+        with mock.patch("custom_components.oshhome.coordinator.asyncio.sleep", sleep_mock):
+            with self.assertLogs("custom_components.oshhome.coordinator", level="DEBUG") as logs:
+                with self.assertRaises(asyncio.CancelledError):
+                    await coordinator._async_stream_loop()
+
+        self.assertEqual(sleep_mock.await_count, 1)
+        self.assertEqual(sleep_mock.await_args_list[0].args, (1,))
+        self.assertEqual(replay_calls["count"], 2)
+        self.assertTrue(
+            any("closed gracefully" in message for message in logs.output),
+            logs.output,
+        )
+        self.assertFalse(any("WARNING" in message for message in logs.output), logs.output)
+
+    async def test_stream_loop_abnormal_close_logs_warning(self) -> None:
+        ws_msg_type = sys.modules["aiohttp"].WSMsgType
+        close_error = OshHomeWebSocketClosed(1006, ws_msg_type.ERROR, "abnormal_close")
+        coordinator, replay_calls = _make_stream_loop_coordinator(close_error)
+        sleep_mock = mock.AsyncMock(return_value=None)
+
+        with mock.patch("custom_components.oshhome.coordinator.asyncio.sleep", sleep_mock):
+            with self.assertLogs("custom_components.oshhome.coordinator", level="WARNING") as logs:
+                with self.assertRaises(asyncio.CancelledError):
+                    await coordinator._async_stream_loop()
+
+        self.assertEqual(sleep_mock.await_count, 1)
+        self.assertEqual(sleep_mock.await_args_list[0].args, (1,))
+        self.assertEqual(replay_calls["count"], 2)
+        self.assertTrue(
+            any("closed unexpectedly" in message for message in logs.output),
+            logs.output,
+        )
 
     def test_known_delta_updates_runtime(self) -> None:
         coordinator = OshHomeCoordinator.__new__(OshHomeCoordinator)
@@ -455,6 +526,69 @@ class CoordinatorUnknownDeltaTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class EntityManagerCleanupTest(unittest.IsolatedAsyncioTestCase):
+    async def test_async_unload_schedules_entity_remove_tasks(self) -> None:
+        hass = _FakeHass()
+        coordinator = _ManagerTestCoordinator(hass, initial_uids={"sensor_1", "sensor_2"})
+        created_entities: dict[str, _RemovableEntity] = {}
+        manager = OshHomeEntityManager(
+            coordinator,
+            "sensor",
+            lambda _entities: None,
+            lambda uid: created_entities.setdefault(uid, _RemovableEntity(uid)),
+        )
+
+        await manager.async_setup()
+        manager.async_unload()
+
+        self.assertEqual(manager._entities, {})
+        self.assertEqual(len(hass.tasks), 2)
+
+        await asyncio.gather(*hass.tasks)
+        self.assertTrue(all(entity.removed for entity in created_entities.values()))
+        self.assertEqual(len(manager._remove_tasks), 0)
+
+    async def test_inventory_remove_schedules_entity_remove_task(self) -> None:
+        hass = _FakeHass()
+        coordinator = _ManagerTestCoordinator(hass, initial_uids={"sensor_1"})
+        created_entities: dict[str, _RemovableEntity] = {}
+        manager = OshHomeEntityManager(
+            coordinator,
+            "sensor",
+            lambda _entities: None,
+            lambda uid: created_entities.setdefault(uid, _RemovableEntity(uid)),
+        )
+
+        await manager.async_setup()
+        manager._handle_inventory_update(set(), {"sensor_1"})
+
+        self.assertEqual(manager._entities, {})
+        self.assertEqual(len(hass.tasks), 1)
+
+        await asyncio.gather(*hass.tasks)
+        self.assertTrue(created_entities["sensor_1"].removed)
+        self.assertEqual(len(manager._remove_tasks), 0)
+
+    async def test_async_unload_skips_remove_for_detached_entity(self) -> None:
+        hass = _FakeHass()
+        coordinator = _ManagerTestCoordinator(hass, initial_uids={"sensor_1"})
+        created_entities: dict[str, _RemovableEntity] = {}
+        manager = OshHomeEntityManager(
+            coordinator,
+            "sensor",
+            lambda _entities: None,
+            lambda uid: created_entities.setdefault(uid, _RemovableEntity(uid, hass=None)),
+        )
+
+        await manager.async_setup()
+        manager.async_unload()
+
+        self.assertEqual(manager._entities, {})
+        self.assertEqual(len(hass.tasks), 0)
+        self.assertEqual(created_entities["sensor_1"].remove_calls, 0)
+        self.assertEqual(len(manager._remove_tasks), 0)
+
+
 def _make_bootstrap_coordinator() -> OshHomeCoordinator:
     coordinator = OshHomeCoordinator.__new__(OshHomeCoordinator)
     coordinator.cursor = 0
@@ -521,6 +655,71 @@ def _minimal_bootstrap() -> dict[str, Any]:
             },
         ],
     }
+
+
+def _make_stream_loop_coordinator(
+    first_stream_exception: Exception,
+) -> tuple[OshHomeCoordinator, dict[str, int]]:
+    coordinator = OshHomeCoordinator.__new__(OshHomeCoordinator)
+    coordinator.cursor = 0
+    coordinator._installation_id = "test-installation"
+    coordinator.entry = types.SimpleNamespace(async_start_reauth=lambda _hass: None)
+    coordinator.hass = _FakeHass()
+    coordinator.client = _StreamLoopClient(first_stream_exception)
+    replay_calls = {"count": 0}
+
+    async def _fake_replay_since_cursor() -> None:
+        replay_calls["count"] += 1
+
+    coordinator._async_replay_since_cursor = _fake_replay_since_cursor  # type: ignore[method-assign]
+    return coordinator, replay_calls
+
+
+class _StreamLoopClient:
+    def __init__(self, first_stream_exception: Exception) -> None:
+        self._first_stream_exception = first_stream_exception
+        self._stream_calls = 0
+
+    async def async_stream(self, *_args, **_kwargs):
+        self._stream_calls += 1
+        if self._stream_calls == 1:
+            raise self._first_stream_exception
+        raise asyncio.CancelledError()
+        if False:  # pragma: no cover - keep this an async generator
+            yield {}
+
+
+class _RemovableEntity:
+    def __init__(self, uid: str, hass: Any = object()) -> None:
+        self.uid = uid
+        self.hass = hass
+        self.removed = False
+        self.remove_calls = 0
+
+    async def async_remove(self) -> None:
+        self.remove_calls += 1
+        await asyncio.sleep(0)
+        self.removed = True
+
+
+class _ManagerTestCoordinator:
+    def __init__(self, hass: _FakeHass, initial_uids: set[str]) -> None:
+        self.hass = hass
+        self._initial_uids = initial_uids
+        self._callbacks: dict[str, Any] = {}
+
+    def entities_for_platform(self, platform: str) -> list[dict[str, str]]:
+        if platform != "sensor":
+            return []
+        return [{"entity_uid": uid} for uid in self._initial_uids]
+
+    def async_subscribe_inventory(self, platform: str, callback):
+        self._callbacks[platform] = callback
+
+        def _unsubscribe() -> None:
+            self._callbacks.pop(platform, None)
+
+        return _unsubscribe
 
 
 if __name__ == "__main__":
